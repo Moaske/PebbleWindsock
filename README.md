@@ -1,4 +1,4 @@
-# PebbleWindsock
+# Pebble WindSock
 Basic Windsock app for Pebble watch.
 I mainly built this for a quick wind check whilst drone flying, but I can imagine it being useful for many other an outdoor activity :-)
 
