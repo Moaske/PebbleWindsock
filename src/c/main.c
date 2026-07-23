@@ -285,7 +285,7 @@ static void main_window_load(Window *window) {
   // font ladder doesn't offer a clean 10-20% step, so compact screens keep
   // the original size exactly and only the roomier tier gets a small nudge.
   GFont font_location = fonts_get_system_font(compact ? FONT_KEY_GOTHIC_14_BOLD : FONT_KEY_GOTHIC_28_BOLD);
-  GFont font_label    = fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
+  GFont font_label    = fonts_get_system_font(compact ? FONT_KEY_GOTHIC_14_BOLD : FONT_KEY_GOTHIC_18_BOLD);
   GFont font_value    = fonts_get_system_font(compact ? FONT_KEY_GOTHIC_28_BOLD : FONT_KEY_BITHAM_30_BLACK);
 
   int loc_h      = compact ? 16 : 26;
@@ -593,7 +593,7 @@ static void graph_update_proc(Layer *layer, GContext *ctx) {
 
   // Legend line at the very bottom explaining which line style is which.
   graphics_context_set_text_color(ctx, GColorBlack);
-  graphics_draw_text(ctx, "10m__ | Gusts-- | 100m..", legend_font,
+  graphics_draw_text(ctx, "10m—— | Gusts-- | 100m••", legend_font,
                       GRect(0, bounds.size.h - legend_h, bounds.size.w, legend_h),
                       GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 }
