@@ -2,7 +2,8 @@
 Basic Windsock app for Pebble watch.
 I mainly built this for a quick wind check whilst drone flying, but I can imagine it being useful for many other an outdoor activity :-)
 
-- Current release: 1.2.0
+- Current release: 1.3.0
+- See releases for changelog
 - Also released app to Pebble Store. PBW available in releases here
 
 ## Features
