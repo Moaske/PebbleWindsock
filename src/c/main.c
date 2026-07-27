@@ -50,6 +50,26 @@ static GColor color_for_value(int value) {
 }
 
 static void refresh_main_window(void);
+static void update_all_status_displays(void);
+
+static AppTimer *s_timeout_timer;
+#define FORECAST_TIMEOUT_MS 25000
+
+static void cancel_timeout_timer(void) {
+  if (s_timeout_timer) {
+    app_timer_cancel(s_timeout_timer);
+    s_timeout_timer = NULL;
+  }
+}
+
+static void timeout_handler(void *data) {
+  s_timeout_timer = NULL;
+  if (!s_has_data) {
+    strncpy(s_status_text, "Timed out. Press Select to retry.", sizeof(s_status_text) - 1);
+    s_status_text[sizeof(s_status_text) - 1] = '\0';
+    update_all_status_displays();
+  }
+}
 
 // ---------------------------------------------------------------------
 // Data request / parsing
@@ -60,6 +80,9 @@ static void request_forecast(void) {
   s_row_count = 0;
   strncpy(s_status_text, "Fetching forecast...", sizeof(s_status_text) - 1);
   refresh_main_window();
+
+  cancel_timeout_timer();
+  s_timeout_timer = app_timer_register(FORECAST_TIMEOUT_MS, timeout_handler, NULL);
 
   DictionaryIterator *iter;
   if (app_message_outbox_begin(&iter) == APP_MSG_OK && iter) {
@@ -115,7 +138,27 @@ static void parse_forecast(const char *data) {
   }
 }
 
+static void update_all_status_displays(void) {
+  refresh_main_window();
+
+  if (s_menu_layer) {
+    text_layer_set_text(s_forecast_status_layer, s_has_data ? "" : s_status_text);
+    layer_set_hidden(text_layer_get_layer(s_forecast_status_layer), s_has_data);
+    layer_set_hidden(menu_layer_get_layer(s_menu_layer), !s_has_data);
+    menu_layer_reload_data(s_menu_layer);
+  }
+
+  if (s_graph_layer) {
+    text_layer_set_text(s_graph_status_layer, s_has_data ? "" : s_status_text);
+    layer_set_hidden(text_layer_get_layer(s_graph_status_layer), s_has_data);
+    layer_set_hidden(s_graph_layer, !s_has_data);
+    layer_mark_dirty(s_graph_layer);
+  }
+}
+
 static void inbox_received_handler(DictionaryIterator *iter, void *context) {
+  cancel_timeout_timer();
+
   Tuple *err_tuple  = dict_find(iter, MESSAGE_KEY_ERROR);
   Tuple *data_tuple = dict_find(iter, MESSAGE_KEY_FORECAST_DATA);
   Tuple *loc_tuple  = dict_find(iter, MESSAGE_KEY_LOCATION_NAME);
@@ -136,33 +179,21 @@ static void inbox_received_handler(DictionaryIterator *iter, void *context) {
     }
   }
 
-  refresh_main_window();
-
-  if (s_menu_layer) {
-    text_layer_set_text(s_forecast_status_layer, s_has_data ? "" : s_status_text);
-    layer_set_hidden(text_layer_get_layer(s_forecast_status_layer), s_has_data);
-    layer_set_hidden(menu_layer_get_layer(s_menu_layer), !s_has_data);
-    menu_layer_reload_data(s_menu_layer);
-  }
-
-  if (s_graph_layer) {
-    text_layer_set_text(s_graph_status_layer, s_has_data ? "" : s_status_text);
-    layer_set_hidden(text_layer_get_layer(s_graph_status_layer), s_has_data);
-    layer_set_hidden(s_graph_layer, !s_has_data);
-    layer_mark_dirty(s_graph_layer);
-  }
+  update_all_status_displays();
 }
 
 static void inbox_dropped_handler(AppMessageResult reason, void *context) {
-  strncpy(s_status_text, "Message dropped", sizeof(s_status_text) - 1);
+  cancel_timeout_timer();
+  strncpy(s_status_text, "Message dropped. Press Select to retry.", sizeof(s_status_text) - 1);
   s_has_data = false;
-  refresh_main_window();
+  update_all_status_displays();
 }
 
 static void outbox_failed_handler(DictionaryIterator *iter, AppMessageResult reason, void *context) {
-  strncpy(s_status_text, "Send to phone failed", sizeof(s_status_text) - 1);
+  cancel_timeout_timer();
+  strncpy(s_status_text, "Send to phone failed. Press Select to retry.", sizeof(s_status_text) - 1);
   s_has_data = false;
-  refresh_main_window();
+  update_all_status_displays();
 }
 
 // ---------------------------------------------------------------------
@@ -288,7 +319,7 @@ static void main_window_load(Window *window) {
   GFont font_label    = fonts_get_system_font(compact ? FONT_KEY_GOTHIC_14_BOLD : FONT_KEY_GOTHIC_18_BOLD);
   GFont font_value    = fonts_get_system_font(compact ? FONT_KEY_GOTHIC_28_BOLD : FONT_KEY_BITHAM_30_BLACK);
 
-  int loc_h      = compact ? 16 : 26;
+  int loc_h      = compact ? 20 : 34;
   int label_h    = compact ? 16 : 18;
   int value_h    = compact ? 28 : 36;
   int gap        = compact ? 0 : 1;
@@ -304,8 +335,9 @@ static void main_window_load(Window *window) {
   // Direction arrow sits inline on the same row as "At 10m:" rather than
   // overlapping the location name above it - avoids any cutoff.
   int row1_h = arrow_size > label_h ? arrow_size : label_h;
+  int label_y_offset = row1_h - label_h; // vertically align label bottom within the taller row
 
-  s_lbl_10m_layer = text_layer_create(GRect(4, y, content_width - arrow_size - 12, row1_h));
+  s_lbl_10m_layer = text_layer_create(GRect(4, y + label_y_offset, content_width - arrow_size - 12, label_h));
   text_layer_set_font(s_lbl_10m_layer, font_label);
   text_layer_set_text(s_lbl_10m_layer, "At 10m:");
   layer_add_child(window_layer, text_layer_get_layer(s_lbl_10m_layer));
@@ -335,7 +367,7 @@ static void main_window_load(Window *window) {
 
   s_lbl_100m_layer = text_layer_create(GRect(4, y, content_width - 8, label_h));
   text_layer_set_font(s_lbl_100m_layer, font_label);
-  text_layer_set_text(s_lbl_100m_layer, "At 100m:");
+  text_layer_set_text(s_lbl_100m_layer, "At 120m:");
   layer_add_child(window_layer, text_layer_get_layer(s_lbl_100m_layer));
   y += label_h;
 
@@ -567,7 +599,7 @@ static void graph_update_proc(Layer *layer, GContext *ctx) {
         graphics_context_set_stroke_width(ctx, 2);
         graphics_draw_line(ctx, prev10, p10);
 
-        graphics_context_set_stroke_color(ctx, GColorDarkGray);
+        graphics_context_set_stroke_color(ctx, GColorDarkCandyAppleRed);
         graphics_context_set_stroke_width(ctx, 3);
         draw_dashed_line(ctx, prev_gust, pgust, 4);
 
@@ -593,7 +625,7 @@ static void graph_update_proc(Layer *layer, GContext *ctx) {
 
   // Legend line at the very bottom explaining which line style is which.
   graphics_context_set_text_color(ctx, GColorBlack);
-  graphics_draw_text(ctx, "10m—— | Gusts-- | 100m••", legend_font,
+  graphics_draw_text(ctx, "10m—— Gusts--- 120m……", legend_font,
                       GRect(0, bounds.size.h - legend_h, bounds.size.w, legend_h),
                       GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 }
