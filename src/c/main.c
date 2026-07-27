@@ -29,7 +29,14 @@ static ActionBarLayer *s_action_bar;
 static GBitmap *s_icon_graph;
 static GBitmap *s_icon_list_forecast;
 static GBitmap *s_icon_refresh;
-static TextLayer *s_location_layer;
+static Layer *s_location_layer;
+static GFont s_location_font;
+static int s_location_scroll_offset = 0;
+static int s_location_scroll_max = 0;
+static bool s_location_scroll_forward = true;
+static AppTimer *s_location_scroll_timer;
+#define LOCATION_SCROLL_STEP_MS 50
+#define LOCATION_SCROLL_PAUSE_MS 800
 static TextLayer *s_lbl_10m_layer, *s_val_10m_layer;
 static TextLayer *s_lbl_gusts_layer, *s_val_gusts_layer;
 static TextLayer *s_lbl_100m_layer, *s_val_100m_layer;
@@ -51,6 +58,7 @@ static GColor color_for_value(int value) {
 
 static void refresh_main_window(void);
 static void update_all_status_displays(void);
+static void trigger_location_scroll(void);
 
 static AppTimer *s_timeout_timer;
 #define FORECAST_TIMEOUT_MS 25000
@@ -140,6 +148,10 @@ static void parse_forecast(const char *data) {
 
 static void update_all_status_displays(void) {
   refresh_main_window();
+
+  if (s_has_data) {
+    trigger_location_scroll();
+  }
 
   if (s_menu_layer) {
     text_layer_set_text(s_forecast_status_layer, s_has_data ? "" : s_status_text);
@@ -247,10 +259,99 @@ static void main_arrow_update_proc(Layer *layer, GContext *ctx) {
   }
 }
 
+static void location_layer_update_proc(Layer *layer, GContext *ctx) {
+  GRect bounds = layer_get_bounds(layer);
+  graphics_context_set_text_color(ctx, GColorBlack);
+  // Text is drawn into a much wider box than the layer itself; Pebble clips
+  // all drawing to the layer's own bounds automatically, so shifting the
+  // box left (negative x) progressively reveals more of the tail end while
+  // everything outside stays invisible - this is what makes the scroll work.
+  graphics_draw_text(ctx, s_location_name, s_location_font,
+                      GRect(-s_location_scroll_offset, 0, bounds.size.w + 400, bounds.size.h),
+                      GTextOverflowModeFill, GTextAlignmentLeft, NULL);
+}
+
+static void location_scroll_timer_callback(void *data) {
+  if (s_location_scroll_forward) {
+    s_location_scroll_offset += 1;
+    if (s_location_scroll_offset >= s_location_scroll_max) {
+      s_location_scroll_offset = s_location_scroll_max;
+      layer_mark_dirty(s_location_layer);
+      s_location_scroll_forward = false; // now just waiting out the pause before snapping back
+      s_location_scroll_timer = app_timer_register(LOCATION_SCROLL_PAUSE_MS, location_scroll_timer_callback, NULL);
+      return;
+    }
+    layer_mark_dirty(s_location_layer);
+    s_location_scroll_timer = app_timer_register(LOCATION_SCROLL_STEP_MS, location_scroll_timer_callback, NULL);
+  } else {
+    // Pause is over - snap straight back to the start, no animated return.
+    s_location_scroll_offset = 0;
+    layer_mark_dirty(s_location_layer);
+    s_location_scroll_timer = NULL;
+  }
+}
+
+// Starts a single scroll-right-then-back cycle revealing the full location
+// name once, then resets to the normal (possibly clipped) resting position.
+// Callable both automatically after a fresh fetch and independently (e.g.
+// from a touch tap) without needing a data refresh.
+static void trigger_location_scroll(void) {
+  if (!s_location_layer) return;
+
+  GRect bounds = layer_get_bounds(s_location_layer);
+  GSize content_size = graphics_text_layout_get_content_size(
+      s_location_name, s_location_font, GRect(0, 0, 1000, bounds.size.h + 10),
+      GTextOverflowModeFill, GTextAlignmentLeft);
+  int overflow = content_size.w - bounds.size.w;
+  s_location_scroll_max = overflow > 0 ? overflow : 0;
+
+  if (s_location_scroll_timer) {
+    app_timer_cancel(s_location_scroll_timer);
+    s_location_scroll_timer = NULL;
+  }
+
+  s_location_scroll_offset = 0;
+  layer_mark_dirty(s_location_layer);
+
+  if (s_location_scroll_max <= 0) {
+    return; // text already fits fully - nothing to scroll
+  }
+
+  s_location_scroll_forward = true;
+  s_location_scroll_timer = app_timer_register(LOCATION_SCROLL_STEP_MS, location_scroll_timer_callback, NULL);
+}
+
+#if defined(PBL_TOUCH)
+static void main_touch_handler(const TouchEvent *event, void *context) {
+  if (event->type != TouchEvent_Touchdown) return;
+  if (!s_location_layer) return;
+
+  GRect frame = layer_get_frame(s_location_layer);
+  GPoint p = GPoint(event->x, event->y);
+  if (grect_contains_point(&frame, &p)) {
+    trigger_location_scroll();
+  }
+}
+#endif
+
+static void main_window_appear(Window *window) {
+#if defined(PBL_TOUCH)
+  if (touch_service_is_enabled()) {
+    touch_service_subscribe(main_touch_handler, NULL);
+  }
+#endif
+}
+
+static void main_window_disappear(Window *window) {
+#if defined(PBL_TOUCH)
+  touch_service_unsubscribe();
+#endif
+}
+
 static void refresh_main_window(void) {
   if (!s_location_layer) return; // main window not currently loaded
 
-  text_layer_set_text(s_location_layer, s_location_name);
+  layer_mark_dirty(s_location_layer);
 
   if (!s_has_data) {
     text_layer_set_text(s_main_status_layer, s_status_text);
@@ -315,7 +416,7 @@ static void main_window_load(Window *window) {
   // Fonts stay at (or very close to) their original sizes - the built-in
   // font ladder doesn't offer a clean 10-20% step, so compact screens keep
   // the original size exactly and only the roomier tier gets a small nudge.
-  GFont font_location = fonts_get_system_font(compact ? FONT_KEY_GOTHIC_14_BOLD : FONT_KEY_GOTHIC_28_BOLD);
+  GFont font_location = fonts_get_system_font(compact ? FONT_KEY_GOTHIC_18_BOLD : FONT_KEY_GOTHIC_28_BOLD);
   GFont font_label    = fonts_get_system_font(compact ? FONT_KEY_GOTHIC_14_BOLD : FONT_KEY_GOTHIC_18_BOLD);
   GFont font_value    = fonts_get_system_font(compact ? FONT_KEY_GOTHIC_28_BOLD : FONT_KEY_BITHAM_30_BLACK);
 
@@ -325,17 +426,17 @@ static void main_window_load(Window *window) {
   int gap        = compact ? 0 : 1;
   int arrow_size = compact ? 28 : 40;
 
-  s_location_layer = text_layer_create(GRect(4, 0, content_width - 8, loc_h));
-  text_layer_set_font(s_location_layer, font_location);
-  text_layer_set_text(s_location_layer, s_location_name);
-  layer_add_child(window_layer, text_layer_get_layer(s_location_layer));
+  s_location_font = font_location;
+  s_location_layer = layer_create(GRect(4, 0, content_width - 8, loc_h));
+  layer_set_update_proc(s_location_layer, location_layer_update_proc);
+  layer_add_child(window_layer, s_location_layer);
 
   int y = loc_h + gap;
 
   // Direction arrow sits inline on the same row as "At 10m:" rather than
   // overlapping the location name above it - avoids any cutoff.
   int row1_h = arrow_size > label_h ? arrow_size : label_h;
-  int label_y_offset = row1_h - label_h; // vertically align label bottom within the taller row
+  int label_y_offset = (row1_h - label_h) / 2; // vertically center label within the taller row
 
   s_lbl_10m_layer = text_layer_create(GRect(4, y + label_y_offset, content_width - arrow_size - 12, label_h));
   text_layer_set_font(s_lbl_10m_layer, font_label);
@@ -383,14 +484,23 @@ static void main_window_load(Window *window) {
   layer_add_child(window_layer, text_layer_get_layer(s_main_status_layer));
 
   refresh_main_window();
+  trigger_location_scroll();
 }
 
 static void main_window_unload(Window *window) {
+  if (s_location_scroll_timer) {
+    app_timer_cancel(s_location_scroll_timer);
+    s_location_scroll_timer = NULL;
+  }
+#if defined(PBL_TOUCH)
+  touch_service_unsubscribe();
+#endif
+
   action_bar_layer_destroy(s_action_bar);
   gbitmap_destroy(s_icon_graph);
   gbitmap_destroy(s_icon_list_forecast);
   gbitmap_destroy(s_icon_refresh);
-  text_layer_destroy(s_location_layer);
+  layer_destroy(s_location_layer);
   text_layer_destroy(s_lbl_10m_layer);
   text_layer_destroy(s_val_10m_layer);
   text_layer_destroy(s_lbl_gusts_layer);
@@ -472,6 +582,49 @@ static void forecast_draw_row(GContext *ctx, const Layer *cell_layer, MenuIndex 
   }
 }
 
+#if defined(PBL_TOUCH)
+static int s_forecast_touch_start_y;
+static GPoint s_forecast_touch_start_offset;
+static bool s_forecast_touch_dragging = false;
+
+static void forecast_touch_handler(const TouchEvent *event, void *context) {
+  if (!s_menu_layer) return;
+  ScrollLayer *scroll_layer = menu_layer_get_scroll_layer(s_menu_layer);
+
+  switch (event->type) {
+    case TouchEvent_Touchdown:
+      s_forecast_touch_start_y = event->y;
+      s_forecast_touch_start_offset = scroll_layer_get_content_offset(scroll_layer);
+      s_forecast_touch_dragging = true;
+      break;
+    case TouchEvent_PositionUpdate:
+      if (s_forecast_touch_dragging) {
+        int delta = event->y - s_forecast_touch_start_y;
+        GPoint new_offset = GPoint(s_forecast_touch_start_offset.x, s_forecast_touch_start_offset.y + delta);
+        scroll_layer_set_content_offset(scroll_layer, new_offset, false);
+      }
+      break;
+    case TouchEvent_Liftoff:
+      s_forecast_touch_dragging = false;
+      break;
+  }
+}
+#endif
+
+static void forecast_window_appear(Window *window) {
+#if defined(PBL_TOUCH)
+  if (touch_service_is_enabled()) {
+    touch_service_subscribe(forecast_touch_handler, NULL);
+  }
+#endif
+}
+
+static void forecast_window_disappear(Window *window) {
+#if defined(PBL_TOUCH)
+  touch_service_unsubscribe();
+#endif
+}
+
 static void forecast_window_load(Window *window) {
   Layer *window_layer = window_get_root_layer(window);
   GRect bounds = layer_get_bounds(window_layer);
@@ -497,6 +650,9 @@ static void forecast_window_load(Window *window) {
 }
 
 static void forecast_window_unload(Window *window) {
+#if defined(PBL_TOUCH)
+  touch_service_unsubscribe();
+#endif
   menu_layer_destroy(s_menu_layer);
   text_layer_destroy(s_forecast_status_layer);
   s_menu_layer = NULL;
@@ -664,12 +820,16 @@ static void init(void) {
   window_set_window_handlers(s_main_window, (WindowHandlers) {
     .load = main_window_load,
     .unload = main_window_unload,
+    .appear = main_window_appear,
+    .disappear = main_window_disappear,
   });
 
   s_forecast_window = window_create();
   window_set_window_handlers(s_forecast_window, (WindowHandlers) {
     .load = forecast_window_load,
     .unload = forecast_window_unload,
+    .appear = forecast_window_appear,
+    .disappear = forecast_window_disappear,
   });
 
   s_graph_window = window_create();
