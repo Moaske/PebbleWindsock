@@ -8,6 +8,8 @@
 var GPS_TIMEOUT_MS = 20000;
 var FETCH_TIMEOUT_MS = 18000;
 var DEFAULT_WIND_MODEL = 'global';
+var DEFAULT_WIND_UNIT = 'kmh';
+var WIND_UNIT_CODES = { kmh: 0, mph: 1, ms: 2, kts: 3 }; // must match watch-side WIND_UNIT_SUFFIX order
 
 function pad(n) {
   return n < 10 ? '0' + n : '' + n;
@@ -22,6 +24,26 @@ function getWindModelSetting() {
   }
 }
 
+function getWindUnitSetting() {
+  try {
+    var v = localStorage.getItem('wind_unit');
+    return (v === 'mph' || v === 'ms' || v === 'kts') ? v : DEFAULT_WIND_UNIT;
+  } catch (e) {
+    return DEFAULT_WIND_UNIT;
+  }
+}
+
+// Open-Meteo is always requested in km/h (wind_speed_unit=kmh) regardless of
+// the user's display preference - conversion to mph/m/s/knots happens here,
+// once, so the watch never needs to know about units at all, just display
+// numbers.
+function convertFromKmh(valueKmh, unit) {
+  if (unit === 'mph') return valueKmh * 0.621371;
+  if (unit === 'ms') return valueKmh / 3.6;
+  if (unit === 'kts') return valueKmh * 0.539957;
+  return valueKmh;
+}
+
 function sendError(code) {
   Pebble.sendAppMessage(
     { 'ERROR': code },
@@ -34,7 +56,7 @@ function sendError(code) {
 // altitude" wind reading - wind_speed_100m for Benelux/KNMI, or
 // wind_speed_120m for the Global/best_match model (100m itself isn't a
 // standard variable outside KNMI's own Netherlands-specific model).
-function buildRowsPayload(json, highAltKey) {
+function buildRowsPayload(json, highAltKey, unit) {
   var times = json.hourly.time;             // e.g. "2026-07-22T17:00"
   var wind10 = json.hourly.wind_speed_10m;
   var windHigh = json.hourly[highAltKey];
@@ -61,11 +83,32 @@ function buildRowsPayload(json, highAltKey) {
   var rows = [];
   for (var j = startIdx; j < endIdx; j++) {
     var hour = parseInt(times[j].substring(11, 13), 10);
-    rows.push(hour + ',' + Math.round(wind10[j]) + ',' +
-              Math.round(gusts[j]) + ',' + Math.round(windHigh[j]) + ',' +
+    rows.push(hour + ',' + Math.round(convertFromKmh(wind10[j], unit)) + ',' +
+              Math.round(convertFromKmh(gusts[j], unit)) + ',' +
+              Math.round(convertFromKmh(windHigh[j], unit)) + ',' +
               Math.round(dir10[j]));
   }
   return rows.join('|');
+}
+
+// Strips administrative-boundary prefixes that sometimes come attached to
+// the raw boundary name (e.g. "Gemeente Tilburg", "Arrondissement Antwerpen")
+// so only the actual place name is shown. Kept as a defensive fallback in
+// case 'locality' is ever empty and we fall back to 'city'.
+var ADMIN_PREFIX_RE = /^(gemeente|stad|stadsdeel|arrondissement|provincie|province of|municipality of|city of|county of|district of|borough of|commune de|ville de)\s+/i;
+
+function cleanLocationName(name) {
+  if (!name) return name;
+  return name.replace(ADMIN_PREFIX_RE, '').trim();
+}
+
+// 'locality' is consistently the clean settlement name (confirmed against a
+// real response: city="Gemeente Tilburg", locality="Tilburg") - 'city' is
+// the field prone to echoing a raw administrative boundary label complete
+// with its official prefix, so it's only used as a fallback here.
+function extractLocationName(data) {
+  var name = data.locality || data.city || data.principalSubdivision || null;
+  return name ? cleanLocationName(name) : 'Unknown location';
 }
 
 function fetchLocationName(lat, lon, callback) {
@@ -76,8 +119,7 @@ function fetchLocationName(lat, lon, callback) {
     if (xhr.status === 200) {
       try {
         var data = JSON.parse(xhr.responseText);
-        var name = data.city || data.locality || data.principalSubdivision || 'Unknown location';
-        callback(name);
+        callback(extractLocationName(data));
       } catch (e) {
         callback('Unknown location');
       }
@@ -94,6 +136,7 @@ function fetchLocationName(lat, lon, callback) {
 
 function fetchForecast(lat, lon, callback) {
   var modelSetting = getWindModelSetting();
+  var unitSetting = getWindUnitSetting();
   var modelParam, highAltKey;
   if (modelSetting === 'benelux') {
     modelParam = 'knmi_seamless';
@@ -116,7 +159,7 @@ function fetchForecast(lat, lon, callback) {
     if (xhr.status === 200) {
       try {
         var json = JSON.parse(xhr.responseText);
-        callback(null, buildRowsPayload(json, highAltKey));
+        callback(null, buildRowsPayload(json, highAltKey, unitSetting));
       } catch (e) {
         callback('PARSE_ERR');
       }
@@ -132,6 +175,9 @@ function fetchForecast(lat, lon, callback) {
 }
 
 function runFetchAndSend(lat, lon) {
+  var modelCode = (getWindModelSetting() === 'benelux') ? 1 : 0;
+  var unitCode = WIND_UNIT_CODES[getWindUnitSetting()];
+
   var locationName = null;
   var forecastPayload = null;
   var forecastErr = null;
@@ -146,7 +192,8 @@ function runFetchAndSend(lat, lon) {
     settled = true;
     if (forecastPayload) {
       Pebble.sendAppMessage(
-        { 'FORECAST_DATA': forecastPayload, 'LOCATION_NAME': locationName || 'Unknown location' },
+        { 'FORECAST_DATA': forecastPayload, 'LOCATION_NAME': locationName || 'Unknown location',
+          'WIND_UNIT': unitCode, 'MODEL_TYPE': modelCode },
         function() {}, function(e) { console.log('Send failed: ' + JSON.stringify(e)); }
       );
     } else {
@@ -164,7 +211,8 @@ function runFetchAndSend(lat, lon) {
       return;
     }
     Pebble.sendAppMessage(
-      { 'FORECAST_DATA': forecastPayload, 'LOCATION_NAME': locationName || 'Unknown location' },
+      { 'FORECAST_DATA': forecastPayload, 'LOCATION_NAME': locationName || 'Unknown location',
+        'WIND_UNIT': unitCode, 'MODEL_TYPE': modelCode },
       function() { console.log('Forecast + location sent'); },
       function(e) { console.log('Send failed: ' + JSON.stringify(e)); }
     );
@@ -213,10 +261,11 @@ function fetchAndSend() {
   );
 }
 
-// --- Settings page (Global vs Benelux wind model) ---
+// --- Settings page (wind unit, and Global vs Benelux wind model) ---
 
 function buildConfigHtml() {
-  var current = getWindModelSetting();
+  var currentModel = getWindModelSetting();
+  var currentUnit = getWindUnitSetting();
   var html = '<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">' +
     '<style>' +
     ':root{--bg:#fff;--fg:#111;--sub:#666;--border:#ccc;--accent:#0a84ff;}' +
@@ -225,6 +274,7 @@ function buildConfigHtml() {
     '}' +
     'body{font-family:-apple-system,Roboto,sans-serif;padding:16px;background:var(--bg);color:var(--fg);margin:0;}' +
     'h2{font-size:20px;margin:0 0 8px;color:var(--fg);}' +
+    'h3{font-size:15px;margin:22px 0 8px;color:var(--fg);text-transform:uppercase;letter-spacing:0.03em;}' +
     'p.intro{font-size:15px;color:var(--sub);margin:0 0 18px;line-height:1.4;}' +
     'label{display:flex;align-items:flex-start;gap:10px;margin:0 0 12px;padding:12px;font-size:17px;' +
     'line-height:1.4;color:var(--fg);border:1px solid var(--border);border-radius:10px;}' +
@@ -234,15 +284,29 @@ function buildConfigHtml() {
     'background:var(--accent);color:#fff;}' +
     '</style></head><body>' +
     '<h2>Wind Forecast Settings</h2>' +
+
+    '<h3>Wind speed unit</h3>' +
+    '<label><input type="radio" name="unit" value="kmh"' + (currentUnit === 'kmh' ? ' checked' : '') + '>' +
+    '<span>km/h<small>Default</small></span></label>' +
+    '<label><input type="radio" name="unit" value="mph"' + (currentUnit === 'mph' ? ' checked' : '') + '>' +
+    '<span>mph<small>Miles per hour</small></span></label>' +
+    '<label><input type="radio" name="unit" value="ms"' + (currentUnit === 'ms' ? ' checked' : '') + '>' +
+    '<span>m/s<small>Meters per second</small></span></label>' +
+    '<label><input type="radio" name="unit" value="kts"' + (currentUnit === 'kts' ? ' checked' : '') + '>' +
+    '<span>Knots<small>Nautical miles per hour</small></span></label>' +
+
+    '<h3>Wind model</h3>' +
     '<p class="intro">Choose the wind model below that best fits your location. Global is the default, KNMI is more accurate for Benelux</p>' +
-    '<label><input type="radio" name="model" value="global"' + (current === 'global' ? ' checked' : '') + '>' +
+    '<label><input type="radio" name="model" value="global"' + (currentModel === 'global' ? ' checked' : '') + '>' +
     '<span>Global<small>Worldwide coverage, ~120m high wind reading</small></span></label>' +
-    '<label><input type="radio" name="model" value="benelux"' + (current === 'benelux' ? ' checked' : '') + '>' +
+    '<label><input type="radio" name="model" value="benelux"' + (currentModel === 'benelux' ? ' checked' : '') + '>' +
     '<span>Benelux (KNMI)<small>120m column will actually show 100m high wind</small></span></label>' +
+
     '<button onclick="save()">Save</button>' +
     '<script>function save(){' +
-    'var v=document.querySelector(\'input[name=model]:checked\').value;' +
-    'document.location="pebblejs://close#"+encodeURIComponent(JSON.stringify({wind_model:v}));' +
+    'var unit=document.querySelector(\'input[name=unit]:checked\').value;' +
+    'var model=document.querySelector(\'input[name=model]:checked\').value;' +
+    'document.location="pebblejs://close#"+encodeURIComponent(JSON.stringify({wind_unit:unit,wind_model:model}));' +
     '}</script>' +
     '</body></html>';
   return 'data:text/html;charset=utf-8,' + encodeURIComponent(html);
@@ -258,6 +322,9 @@ Pebble.addEventListener('webviewclosed', function(e) {
     var settings = JSON.parse(decodeURIComponent(e.response));
     if (settings.wind_model === 'global' || settings.wind_model === 'benelux') {
       localStorage.setItem('wind_model', settings.wind_model);
+    }
+    if (settings.wind_unit === 'kmh' || settings.wind_unit === 'mph' || settings.wind_unit === 'ms' || settings.wind_unit === 'kts') {
+      localStorage.setItem('wind_unit', settings.wind_unit);
     }
   } catch (err) {
     console.log('Config parse error: ' + err);

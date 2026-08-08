@@ -1,9 +1,41 @@
 #include <pebble.h>
 
 #define MAX_ROWS 24
-#define GRAPH_POINTS 6
-#define RED_THRESHOLD 45
+#define GRAPH_POINTS 12
 #define ACTIONBAR_ICON_WIDTH 30
+
+// Wind unit: 0 = km/h (default), 1 = mph, 2 = m/s, 3 = knots. Values
+// arriving from the phone are already converted to this unit - the watch
+// never converts.
+static int s_wind_unit = 0;
+static const char *WIND_UNIT_SUFFIX[4] = {"km/h", "mph", "m/s", "kts"};
+
+// Model type: 0 = Global (best_match, ~120m altitude), 1 = Benelux (KNMI,
+// true 100m altitude). Only affects the "At Xm:" label text.
+static int s_model_type = 0;
+
+// Per-unit graph scale: {0, low grid mark, red-warning threshold, axis max}.
+// Roughly-equivalent round numbers per unit rather than exact conversions,
+// so the axis still reads cleanly regardless of which unit is selected.
+static const int GRAPH_MARKS_KMH[4] = {0, 30, 45, 60};
+static const int GRAPH_MARKS_MPH[4] = {0, 15, 28, 40};
+static const int GRAPH_MARKS_MS[4]  = {0, 7, 13, 20};
+static const int GRAPH_MARKS_KTS[4] = {0, 15, 24, 32};
+
+static const int *current_graph_marks(void) {
+  if (s_wind_unit == 1) return GRAPH_MARKS_MPH;
+  if (s_wind_unit == 2) return GRAPH_MARKS_MS;
+  if (s_wind_unit == 3) return GRAPH_MARKS_KTS;
+  return GRAPH_MARKS_KMH;
+}
+
+static int red_threshold(void) {
+  return current_graph_marks()[2];
+}
+
+static int graph_y_max(void) {
+  return current_graph_marks()[3];
+}
 
 typedef struct {
   int hour;
@@ -53,7 +85,7 @@ static Layer *s_graph_layer;
 static TextLayer *s_graph_status_layer;
 
 static GColor color_for_value(int value) {
-  return value > RED_THRESHOLD ? GColorDarkCandyAppleRed : GColorBlack;
+  return value > red_threshold() ? GColorDarkCandyAppleRed : GColorBlack;
 }
 
 static void refresh_main_window(void);
@@ -171,13 +203,29 @@ static void update_all_status_displays(void) {
 static void inbox_received_handler(DictionaryIterator *iter, void *context) {
   cancel_timeout_timer();
 
-  Tuple *err_tuple  = dict_find(iter, MESSAGE_KEY_ERROR);
-  Tuple *data_tuple = dict_find(iter, MESSAGE_KEY_FORECAST_DATA);
-  Tuple *loc_tuple  = dict_find(iter, MESSAGE_KEY_LOCATION_NAME);
+  Tuple *err_tuple    = dict_find(iter, MESSAGE_KEY_ERROR);
+  Tuple *data_tuple   = dict_find(iter, MESSAGE_KEY_FORECAST_DATA);
+  Tuple *loc_tuple    = dict_find(iter, MESSAGE_KEY_LOCATION_NAME);
+  Tuple *unit_tuple   = dict_find(iter, MESSAGE_KEY_WIND_UNIT);
+  Tuple *model_tuple  = dict_find(iter, MESSAGE_KEY_MODEL_TYPE);
 
   if (loc_tuple) {
     strncpy(s_location_name, loc_tuple->value->cstring, sizeof(s_location_name) - 1);
     s_location_name[sizeof(s_location_name) - 1] = '\0';
+  }
+
+  if (unit_tuple) {
+    int u = (int)unit_tuple->value->int32;
+    if (u >= 0 && u <= 3) {
+      s_wind_unit = u;
+    }
+  }
+
+  if (model_tuple) {
+    int m = (int)model_tuple->value->int32;
+    if (m == 0 || m == 1) {
+      s_model_type = m;
+    }
   }
 
   if (err_tuple) {
@@ -361,9 +409,10 @@ static void refresh_main_window(void) {
   layer_set_hidden(text_layer_get_layer(s_main_status_layer), true);
 
   ForecastRow *now = &s_rows[0];
-  snprintf(s_val_10m_buf, sizeof(s_val_10m_buf), "%d km/h", now->wind10);
-  snprintf(s_val_gusts_buf, sizeof(s_val_gusts_buf), "%d km/h", now->gusts);
-  snprintf(s_val_100m_buf, sizeof(s_val_100m_buf), "%d km/h", now->wind100);
+  const char *unit = WIND_UNIT_SUFFIX[s_wind_unit];
+  snprintf(s_val_10m_buf, sizeof(s_val_10m_buf), "%d %s", now->wind10, unit);
+  snprintf(s_val_gusts_buf, sizeof(s_val_gusts_buf), "%d %s", now->gusts, unit);
+  snprintf(s_val_100m_buf, sizeof(s_val_100m_buf), "%d %s", now->wind100, unit);
 
   text_layer_set_text(s_val_10m_layer, s_val_10m_buf);
   text_layer_set_text(s_val_gusts_layer, s_val_gusts_buf);
@@ -372,6 +421,8 @@ static void refresh_main_window(void) {
   text_layer_set_text_color(s_val_10m_layer, color_for_value(now->wind10));
   text_layer_set_text_color(s_val_gusts_layer, color_for_value(now->gusts));
   text_layer_set_text_color(s_val_100m_layer, color_for_value(now->wind100));
+
+  text_layer_set_text(s_lbl_100m_layer, s_model_type == 1 ? "At 100m:" : "At 120m:");
 
   layer_mark_dirty(s_main_arrow_layer);
 }
@@ -537,7 +588,7 @@ static void forecast_draw_row(GContext *ctx, const Layer *cell_layer, MenuIndex 
   GFont value_font = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
 
   bool highlighted = menu_cell_layer_is_highlighted(cell_layer);
-  bool gust_warning = r->gusts > RED_THRESHOLD;
+  bool gust_warning = r->gusts > red_threshold();
 
   GColor bg_color = highlighted ? GColorBlack : (gust_warning ? GColorDarkCandyAppleRed : GColorWhite);
   GColor fg_color = (highlighted || gust_warning) ? GColorWhite : GColorBlack;
@@ -663,8 +714,6 @@ static void forecast_window_unload(Window *window) {
 // GRAPH window (no action bar - Back button returns to main)
 // ---------------------------------------------------------------------
 
-#define GRAPH_Y_MAX 60
-
 // Draws a straight line as a series of short dashes rather than solid -
 // integer-only math (no sqrt/float), splits the segment into num_dashes
 // evenly-spaced dash/gap pairs regardless of segment length.
@@ -709,15 +758,19 @@ static void graph_update_proc(Layer *layer, GContext *ctx) {
   int label_half_h = compact ? 7 : 10;
   int hour_half_w = compact ? 12 : 18;
   int hour_w = compact ? 24 : 36;
+  // With 12 points on the time axis, only every Nth hour gets a label so
+  // they don't collide - narrower (compact) screens skip more aggressively.
+  int hour_label_step = compact ? 3 : 2;
 
   graphics_context_set_stroke_color(ctx, GColorBlack);
   graphics_draw_line(ctx, GPoint(origin_x, margin_top), GPoint(origin_x, origin_y));
   graphics_draw_line(ctx, GPoint(origin_x, origin_y), GPoint(origin_x + plot_w, origin_y));
 
-  int marks[] = {0, 30, 45, 60};
+  const int *marks = current_graph_marks();
+  int y_max = graph_y_max();
   for (int i = 0; i < 4; i++) {
-    int y = origin_y - (marks[i] * plot_h) / GRAPH_Y_MAX;
-    GColor c = (marks[i] == 45) ? GColorDarkCandyAppleRed : GColorLightGray;
+    int y = origin_y - (marks[i] * plot_h) / y_max;
+    GColor c = (marks[i] == red_threshold()) ? GColorDarkCandyAppleRed : GColorLightGray;
     graphics_context_set_stroke_color(ctx, c);
     graphics_draw_line(ctx, GPoint(origin_x, y), GPoint(origin_x + plot_w, y));
 
@@ -739,16 +792,16 @@ static void graph_update_proc(Layer *layer, GContext *ctx) {
       int x = origin_x + (i * plot_w) / (points - 1);
 
       int val10 = s_rows[i].wind10;
-      if (val10 > GRAPH_Y_MAX) val10 = GRAPH_Y_MAX;
-      GPoint p10 = GPoint(x, origin_y - (val10 * plot_h) / GRAPH_Y_MAX);
+      if (val10 > y_max) val10 = y_max;
+      GPoint p10 = GPoint(x, origin_y - (val10 * plot_h) / y_max);
 
       int valg = s_rows[i].gusts;
-      if (valg > GRAPH_Y_MAX) valg = GRAPH_Y_MAX;
-      GPoint pgust = GPoint(x, origin_y - (valg * plot_h) / GRAPH_Y_MAX);
+      if (valg > y_max) valg = y_max;
+      GPoint pgust = GPoint(x, origin_y - (valg * plot_h) / y_max);
 
       int val100 = s_rows[i].wind100;
-      if (val100 > GRAPH_Y_MAX) val100 = GRAPH_Y_MAX;
-      GPoint p100 = GPoint(x, origin_y - (val100 * plot_h) / GRAPH_Y_MAX);
+      if (val100 > y_max) val100 = y_max;
+      GPoint p100 = GPoint(x, origin_y - (val100 * plot_h) / y_max);
 
       if (i > 0) {
         graphics_context_set_stroke_color(ctx, GColorBlack);
@@ -757,21 +810,23 @@ static void graph_update_proc(Layer *layer, GContext *ctx) {
 
         graphics_context_set_stroke_color(ctx, GColorDarkCandyAppleRed);
         graphics_context_set_stroke_width(ctx, 3);
-        draw_dashed_line(ctx, prev_gust, pgust, 4);
+        draw_dashed_line(ctx, prev_gust, pgust, 2);
 
         graphics_context_set_fill_color(ctx, GColorBlack);
-        draw_dotted_line(ctx, prev_100, p100, 10);
+        draw_dotted_line(ctx, prev_100, p100, 5);
       }
 
       graphics_context_set_fill_color(ctx, color_for_value(s_rows[i].wind10));
       graphics_fill_circle(ctx, p10, 3);
 
-      char hbuf[4];
-      snprintf(hbuf, sizeof(hbuf), "%02d", s_rows[i].hour);
-      graphics_context_set_text_color(ctx, GColorBlack);
-      graphics_draw_text(ctx, hbuf, label_font,
-                          GRect(x - hour_half_w, origin_y + 4, hour_w, hour_label_h),
-                          GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+      if (i % hour_label_step == 0 || i == points - 1) {
+        char hbuf[4];
+        snprintf(hbuf, sizeof(hbuf), "%02d", s_rows[i].hour);
+        graphics_context_set_text_color(ctx, GColorBlack);
+        graphics_draw_text(ctx, hbuf, label_font,
+                            GRect(x - hour_half_w, origin_y + 4, hour_w, hour_label_h),
+                            GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+      }
 
       prev10 = p10;
       prev_gust = pgust;

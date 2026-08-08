@@ -14,7 +14,9 @@
             "REQUEST",
             "FORECAST_DATA",
             "ERROR",
-            "LOCATION_NAME"
+            "LOCATION_NAME",
+            "WIND_UNIT",
+            "MODEL_TYPE"
         ],
         "projectType": "native",
         "resources": {
@@ -59,5 +61,5 @@
             "watchface": false
         }
     },
-    "version": "1.3.0"
+    "version": "1.6.0"
 }
